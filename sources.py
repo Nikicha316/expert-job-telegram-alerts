@@ -13,6 +13,7 @@ import logging
 import os
 import re
 from collections.abc import Iterator
+from pathlib import Path
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
@@ -29,6 +30,7 @@ MICRO1_EXPERTS = "https://www.micro1.ai/experts/opportunities"
 MICRO1_PORTAL = "https://jobs.micro1.ai/"
 MICRO1_PUBLIC_FEED = "https://prod-api.micro1.ai/api/v1/job/portal"
 MICRO1_PAGE_SIZE = 100
+MICRO1_SITEMAP = "https://jobs.micro1.ai/sitemap.xml"
 MERCOR_INDEX = "https://work.mercor.com/explore"
 MERCOR_SITEMAP = "https://work.mercor.com/sitemap.xml"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
@@ -531,20 +533,19 @@ def parse_micro1_portal_page(payload):
     return rows, total
 
 
-def fetch_micro1(session=None) -> list[Job]:
-    """Read ALL public Micro1 EXPERT listings with the official site's POST query.
+def _micro1_error_summary(exc):
+    """Safe debugging: include status codes, but not response bodies/tokens."""
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        return f"HTTP {status}" if status is not None else "HTTPError (status unavailable)"
+    if isinstance(exc, requests.Timeout):
+        return "request timeout"
+    return type(exc).__name__
 
-    This replaces third-party indexes and DOM scraping. A failed or partial
-    pagination raises SourceError; bot.py then keeps notification history.
-    """
-    session = session or requests.Session()
-    session.headers.update({
-        **HEADERS,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": "https://www.micro1.ai",
-        "Referer": "https://www.micro1.ai/experts/opportunities",
-    })
+
+def _fetch_micro1_api(session) -> list[Job]:
+    """Primary collector: same public JSON endpoint as micro1's opportunities UI."""
     max_pages = max(1, int(os.environ.get("MICRO1_MAX_PAGES", "15")))
     found = {}
     total = None
@@ -561,29 +562,203 @@ def fetch_micro1(session=None) -> list[Job]:
         except SourceError:
             raise
         except (requests.RequestException, ValueError) as exc:
-            # Do not label blocked requests or incomplete pages as '0 jobs'.
-            raise SourceError(f"Micro1 official feed failed on page {page}: {type(exc).__name__}") from None
+            raise SourceError(
+                f"Micro1 official API page {page}: {_micro1_error_summary(exc)}"
+            ) from None
 
         total = current_total if total is None else max(total, current_total)
         if not rows:
-            raise SourceError(f"Micro1 official feed unexpectedly ended at page {page}/{total}")
+            raise SourceError(f"Micro1 official API ended at page {page} before total {total}")
         for raw in rows:
             job = micro1_job_from_portal(raw)
             if job:
                 found[job.job_id] = job
-        LOG.info("Micro1 official feed: page %d, %d records, %d accepted IDs (total %d)",
+        LOG.info("Micro1 official API: page %d, %d records, %d accepted IDs (total %d)",
                  page, len(rows), len(found), total)
         if page * MICRO1_PAGE_SIZE >= total:
             break
         if len(rows) < MICRO1_PAGE_SIZE:
-            raise SourceError(f"Micro1 official feed returned a short page {page} before total {total}")
+            raise SourceError(f"Micro1 official API returned short page {page} before total {total}")
     else:
-        raise SourceError(f"Micro1 total {total} exceeds {max_pages} pages; refusing incomplete scan")
+        raise SourceError(f"Micro1 total {total} exceeds {max_pages} pages; refusing partial scan")
 
     if not found:
-        raise SourceError("Micro1 official feed returned no usable expert listings; history unchanged")
-    LOG.info("Micro1: fetched %d expert job IDs from official portal", len(found))
+        raise SourceError("Micro1 official API returned no usable expert listings")
+    LOG.info("Micro1: fetched %d expert job IDs from official API", len(found))
     return list(found.values())
+
+
+def _micro1_sitemap_locations(xml_text):
+    """Only permit job posting URLs and child sitemaps on Micro1's own host."""
+    try:
+        root = ET.fromstring(xml_text)
+    except (TypeError, ET.ParseError) as exc:
+        raise SourceError("Micro1 official sitemap XML is invalid") from exc
+    jobs = {}
+    children = []
+    for el in root.iter():
+        if not el.tag.endswith("loc") or not el.text:
+            continue
+        url = el.text.strip()
+        ident = _post_id(url)
+        if ident:
+            jobs[ident] = f"https://jobs.micro1.ai/post/{ident}"
+        elif urlparse(url).netloc.lower() == "jobs.micro1.ai" and "sitemap" in urlparse(url).path.lower():
+            children.append(url)
+    return jobs, children
+
+
+def _micro1_state_for_fallback():
+    """Use the bot's existing history to avoid requesting hundreds of detail pages."""
+    path = Path(os.environ.get("STATE_PATH", "data/seen_jobs.json"))
+    if not path.exists():
+        return set(), True
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        entry = obj.get("sources", {}).get("micro1", {})
+        if not isinstance(entry, dict):
+            raise ValueError("invalid micro1 state")
+        initialized = entry.get("initialized") is True
+        ids = entry.get("seen_ids", [])
+        if not isinstance(ids, list):
+            raise ValueError("invalid seen_ids")
+        return set(ids), not initialized
+    except (OSError, ValueError, AttributeError, TypeError) as exc:
+        raise SourceError("Could not read Micro1 notification history for fallback") from exc
+
+
+def parse_micro1_post_html(html_text, expected_id):
+    """Read structured open-job details from a public Micro1 Next.js posting.
+
+    Next.js RSC serializes job data into self.__next_f.push([1, <JSON string>]).
+    Only accept a job whose ID matches the official sitemap URL, so generic
+    page chrome or unrelated JSON cannot produce false notifications.
+    """
+    if not isinstance(html_text, str):
+        return None
+    chunks = re.findall(
+        r'self\.__next_f\.push\(\[\s*1\s*,\s*("(?:[^"\\]|\\.)*")\s*\]\)',
+        html_text, flags=re.S,
+    )
+    decoded = []
+    for chunk in chunks:
+        try:
+            part = json.loads(chunk)
+            if isinstance(part, str):
+                decoded.append(part)
+        except (TypeError, ValueError):
+            continue
+    stream = "".join(decoded)
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'"(?:data|job)"\s*:\s*(?=\{)', stream):
+        try:
+            record, _ = decoder.raw_decode(stream[match.end():])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        ident = str(_first(record, "client_job_id", "job_id") or "").lower()
+        if ident != expected_id.lower():
+            continue
+        # Reject closed, paused or otherwise unpublished jobs explicitly.
+        status = str(_first(record, "job_status", "status") or "open").lower()
+        if status not in ("open", "active", "published", "live"):
+            return None
+        adapted = dict(record)
+        adapted["job_id"] = ident
+        adapted["job_name"] = _first(record, "job_role_name", "job_name", "title")
+        return micro1_job_from_portal(adapted)
+    return None
+
+
+def _fetch_micro1_sitemap(session, known_ids, initial):
+    """Official-only fallback: sitemap URLs, verify NEW roles from posting pages.
+
+    For first baseline, do not fetch every job page. For subsequent runs fetch
+    only new IDs (capped per run). IDs not yet verified will be retried later.
+    """
+    try:
+        response = session.get(MICRO1_SITEMAP, timeout=TIMEOUT)
+        response.raise_for_status()
+        jobs_by_id, children = _micro1_sitemap_locations(response.text)
+        for child in children[:6]:
+            response = session.get(child, timeout=TIMEOUT)
+            response.raise_for_status()
+            child_jobs, _ = _micro1_sitemap_locations(response.text)
+            jobs_by_id.update(child_jobs)
+    except requests.RequestException as exc:
+        raise SourceError(f"Micro1 official sitemap: {_micro1_error_summary(exc)}") from None
+    if not jobs_by_id:
+        raise SourceError("Micro1 official sitemap contains no canonical posting URLs")
+
+    # Existing IDs are placeholders for the dedup layer, never alerts.
+    found = {ident: Job("micro1", ident, "Existing Micro1 opportunity", url)
+             for ident, url in jobs_by_id.items() if initial or ident in known_ids}
+    if initial:
+        LOG.info("Micro1 official sitemap: baseline %d posting URLs; no old-job alerts", len(found))
+        return list(found.values())
+
+    outstanding = [(ident, url) for ident, url in sorted(jobs_by_id.items())
+                   if ident not in known_ids]
+    limit = max(1, min(int(os.environ.get("MICRO1_MAX_NEW_DETAILS", "15")), 50))
+    unverified = 0
+    verified = 0
+    for ident, url in outstanding[:limit]:
+        try:
+            response = session.get(url, timeout=(6, 12))
+            response.raise_for_status()
+            job = parse_micro1_post_html(response.text, ident)
+        except requests.RequestException as exc:
+            LOG.warning("Micro1 new post %s could not be checked: %s", ident,
+                        _micro1_error_summary(exc))
+            unverified += 1
+            continue
+        if job:
+            found[ident] = job
+            verified += 1
+        else:
+            # May be closed, or markup may have changed: do not notify blindly.
+            LOG.warning("Micro1 new post %s has no verified open-job details", ident)
+            unverified += 1
+    if outstanding and verified == 0 and unverified > 0:
+        raise SourceError(f"Micro1 sitemap found {len(outstanding)} new IDs but could not verify any posting pages")
+    if unverified or len(outstanding) > limit:
+        LOG.warning("Micro1 sitemap: %d new IDs verified; %d unavailable; %d deferred; will retry",
+                    verified, unverified, max(0, len(outstanding) - limit))
+    LOG.info("Micro1 official sitemap: %d URLs, %d new verified open opportunities",
+             len(jobs_by_id), verified)
+    return list(found.values())
+
+
+def fetch_micro1(session=None, known_ids=None, initial=None) -> list[Job]:
+    """Use Micro1's official opportunities API; if unavailable try its own sitemap.
+
+    No third-party listings; never mark unverified new sitemap jobs as seen.
+    """
+    session = session or requests.Session()
+    session.headers.update({
+        **HEADERS,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.micro1.ai",
+        "Referer": "https://www.micro1.ai/experts/opportunities",
+    })
+    try:
+        return _fetch_micro1_api(session)
+    except SourceError as primary:
+        if "HTTP 429" in str(primary):
+            raise  # Respect Micro1's rate limits; try on the next scheduled run.
+        LOG.warning("%s; trying Micro1's own public job sitemap", primary)
+        if known_ids is None or initial is None:
+            stored_ids, is_initial = _micro1_state_for_fallback()
+            if known_ids is None:
+                known_ids = stored_ids
+            if initial is None:
+                initial = is_initial
+        try:
+            return _fetch_micro1_sitemap(session, known_ids, initial)
+        except SourceError as fallback:
+            raise SourceError(f"{primary}; official sitemap fallback: {fallback}") from None
 
 
 def enrich_micro1_new_jobs(jobs: list[Job]) -> list[Job]:
