@@ -3,7 +3,7 @@ name: Micro1 & Mercor Telegram job alerts
 on:
   schedule:
     # UTC; every 15 minutes, avoiding the busiest start-of-hour minute.
-    - cron: '7,22,37,52 * * * *'
+     - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:
