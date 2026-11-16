@@ -1,0 +1,79 @@
+name: Micro1 & Mercor Telegram job alerts
+
+on:
+  schedule:
+    # UTC; every 15 minutes, avoiding the busiest start-of-hour minute.
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run monitoring or test the Telegram connection'
+        type: choice
+        required: true
+        default: monitor
+        options:
+          - monitor
+          - test
+
+# Only needs to write the JSON history back to THIS repository.
+permissions:
+  contents: write
+
+concurrency:
+  group: job-alert-state-main
+  cancel-in-progress: false
+
+jobs:
+  check-jobs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out latest default branch
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Install headless Chromium (for micro1)
+        if: github.event.inputs.mode != 'test'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Monitor jobs or test Telegram
+        id: monitor
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = 'test' ]; then
+            python bot.py --test-telegram
+          else
+            python bot.py
+          fi
+
+      - name: Save notification history to GitHub
+        if: always() && steps.checkout.outcome == 'success'
+        run: |
+          if ! git diff --quiet -- data/seen_jobs.json; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add data/seen_jobs.json
+            git commit -m 'chore: update seen opportunity IDs [skip ci]'
+            git push
+          else
+            echo 'No new history to commit.'
+          fi
+
+      - name: Report monitoring failure
+        if: steps.monitor.outcome == 'failure'
+        run: |
+          echo 'At least one source or Telegram failed. Inspect the monitor step; history was preserved.'
+          exit 1
