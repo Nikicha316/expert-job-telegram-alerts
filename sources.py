@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -23,8 +24,32 @@ from bs4 import BeautifulSoup
 from models import Job
 
 LOG = logging.getLogger(__name__)
-HEADERS = {"User-Agent": "PersonalOpportunityMonitor/1.0 (public jobs only)",
-           "Accept-Language": "en-US,en;q=0.9"}
+
+# Generic headers used by most public requests
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Headers specifically for the Micro1 opportunities API (mimic the real UI)
+MICRO1_API_HEADERS = {
+    **HEADERS,
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "Origin": "https://www.micro1.ai",
+    "Referer": "https://www.micro1.ai/experts/opportunities",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
 TIMEOUT = (12, 25)
 MICRO1_EXPERTS = "https://www.micro1.ai/experts/opportunities"
 MICRO1_PORTAL = "https://jobs.micro1.ai/"
@@ -544,6 +569,39 @@ def _micro1_error_summary(exc):
     return type(exc).__name__
 
 
+def _request_with_retries(session, method, url, *, max_attempts=3, retry_statuses=(403, 429, 502, 503), **kwargs):
+    """Simple retry for transient blocks / rate limits. Does not retry other 4xx."""
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = session.request(method, url, timeout=TIMEOUT, **kwargs)
+            if response.status_code in retry_statuses and attempt < max_attempts:
+                wait = 2.0 * attempt + (0.4 * attempt)
+                LOG.warning(
+                    "Micro1 %s %s → HTTP %s (attempt %d/%d), retrying in %.1fs",
+                    method.upper(), urlparse(url).path, response.status_code,
+                    attempt, max_attempts, wait,
+                )
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                wait = 2.0 * attempt
+                LOG.warning(
+                    "Micro1 request failed (%s), attempt %d/%d, retrying in %.1fs",
+                    _micro1_error_summary(exc), attempt, max_attempts, wait,
+                )
+                time.sleep(wait)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("unreachable")
+
+
 def _fetch_micro1_api(session) -> list[Job]:
     """Primary collector: same public JSON endpoint as micro1's opportunities UI."""
     max_pages = max(1, int(os.environ.get("MICRO1_MAX_PAGES", "15")))
@@ -551,13 +609,13 @@ def _fetch_micro1_api(session) -> list[Job]:
     total = None
     for page in range(1, max_pages + 1):
         try:
-            response = session.post(
+            response = _request_with_retries(
+                session,
+                "POST",
                 MICRO1_PUBLIC_FEED,
                 params={"page": page, "limit": MICRO1_PAGE_SIZE, "keyword": ""},
                 json={"action": "get_all_jobs", "filters": {"type": ["EXPERT"]}},
-                timeout=TIMEOUT,
             )
-            response.raise_for_status()
             rows, current_total = parse_micro1_portal_page(response.json())
         except SourceError:
             raise
@@ -736,13 +794,7 @@ def fetch_micro1(session=None, known_ids=None, initial=None) -> list[Job]:
     No third-party listings; never mark unverified new sitemap jobs as seen.
     """
     session = session or requests.Session()
-    session.headers.update({
-        **HEADERS,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": "https://www.micro1.ai",
-        "Referer": "https://www.micro1.ai/experts/opportunities",
-    })
+    session.headers.update(MICRO1_API_HEADERS)
     try:
         return _fetch_micro1_api(session)
     except SourceError as primary:
