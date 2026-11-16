@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import re
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -24,32 +23,8 @@ from bs4 import BeautifulSoup
 from models import Job
 
 LOG = logging.getLogger(__name__)
-
-# Generic headers used by most public requests
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# Headers specifically for the Micro1 opportunities API (mimic the real UI)
-MICRO1_API_HEADERS = {
-    **HEADERS,
-    "Accept": "application/json, text/plain, */*",
-    "Content-Type": "application/json",
-    "Origin": "https://www.micro1.ai",
-    "Referer": "https://www.micro1.ai/experts/opportunities",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-site",
-    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-}
-
+HEADERS = {"User-Agent": "PersonalOpportunityMonitor/1.0 (public jobs only)",
+           "Accept-Language": "en-US,en;q=0.9"}
 TIMEOUT = (12, 25)
 MICRO1_EXPERTS = "https://www.micro1.ai/experts/opportunities"
 MICRO1_PORTAL = "https://jobs.micro1.ai/"
@@ -58,7 +33,6 @@ MICRO1_PAGE_SIZE = 100
 MICRO1_SITEMAP = "https://jobs.micro1.ai/sitemap.xml"
 MERCOR_INDEX = "https://work.mercor.com/explore"
 MERCOR_SITEMAP = "https://work.mercor.com/sitemap.xml"
-MERCOR_API = "https://aws.api.mercor.com/work/listings-explore-page"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 MERCOR_ID_RE = re.compile(r"list_[a-zA-Z0-9_-]+")
 LOCATION_RE = re.compile(r"\b(?:location|work location|eligible location|geography)\s*[:\-]\s*([^\r\n]{2,170})", re.I)
@@ -278,33 +252,13 @@ def _mercor_detail(html, url):
 
 def fetch_mercor(known_ids: set[str], initial: bool) -> list[Job]:
     session = requests.Session()
-    session.headers.update({
-        **HEADERS,
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://work.mercor.com",
-        "Referer": "https://work.mercor.com/explore",
-    })
-    listings = []
+    session.headers.update(HEADERS)
     try:
-        response = session.get(MERCOR_API, timeout=TIMEOUT)
+        response = session.get(MERCOR_INDEX, timeout=TIMEOUT)
         response.raise_for_status()
-        payload = response.json()
-        records = payload.get("listings") if isinstance(payload, dict) else None
-        if not isinstance(records, list) or not records:
-            raise SourceError("Mercor public API returned no listings array")
-        listings = [job for raw in records if (job := _mercor_to_job(raw))]
-        if not listings:
-            raise SourceError("Mercor public API supplied no active listings")
-        LOG.info("Mercor API: %d raw records, %d active listings", len(records), len(listings))
-    except (requests.RequestException, ValueError, SourceError) as exc:
-        # Fallback: try legacy embedded __NEXT_DATA__ (may be empty on newer deploys)
-        LOG.warning("Mercor API unavailable (%s); trying Explore page embed", type(exc).__name__)
-        try:
-            response = session.get(MERCOR_INDEX, timeout=TIMEOUT)
-            response.raise_for_status()
-            listings = parse_mercor_index(response.text)
-        except (requests.RequestException, SourceError) as exc2:
-            raise SourceError(f"Mercor index unavailable: {type(exc2).__name__}") from None
+        listings = parse_mercor_index(response.text)
+    except (requests.RequestException, SourceError) as exc:
+        raise SourceError(f"Mercor index unavailable: {type(exc).__name__}") from None
 
     jobs = {job.job_id: job for job in listings}
     # Mercor's sitemap has additional published contract roles not present in
@@ -590,39 +544,6 @@ def _micro1_error_summary(exc):
     return type(exc).__name__
 
 
-def _request_with_retries(session, method, url, *, max_attempts=3, retry_statuses=(403, 429, 502, 503), **kwargs):
-    """Simple retry for transient blocks / rate limits. Does not retry other 4xx."""
-    last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = session.request(method, url, timeout=TIMEOUT, **kwargs)
-            if response.status_code in retry_statuses and attempt < max_attempts:
-                wait = 2.0 * attempt + (0.4 * attempt)
-                LOG.warning(
-                    "Micro1 %s %s → HTTP %s (attempt %d/%d), retrying in %.1fs",
-                    method.upper(), urlparse(url).path, response.status_code,
-                    attempt, max_attempts, wait,
-                )
-                time.sleep(wait)
-                continue
-            response.raise_for_status()
-            return response
-        except requests.RequestException as exc:
-            last_exc = exc
-            if attempt < max_attempts:
-                wait = 2.0 * attempt
-                LOG.warning(
-                    "Micro1 request failed (%s), attempt %d/%d, retrying in %.1fs",
-                    _micro1_error_summary(exc), attempt, max_attempts, wait,
-                )
-                time.sleep(wait)
-                continue
-            raise
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("unreachable")
-
-
 def _fetch_micro1_api(session) -> list[Job]:
     """Primary collector: same public JSON endpoint as micro1's opportunities UI."""
     max_pages = max(1, int(os.environ.get("MICRO1_MAX_PAGES", "15")))
@@ -630,13 +551,13 @@ def _fetch_micro1_api(session) -> list[Job]:
     total = None
     for page in range(1, max_pages + 1):
         try:
-            response = _request_with_retries(
-                session,
-                "POST",
+            response = session.post(
                 MICRO1_PUBLIC_FEED,
                 params={"page": page, "limit": MICRO1_PAGE_SIZE, "keyword": ""},
                 json={"action": "get_all_jobs", "filters": {"type": ["EXPERT"]}},
+                timeout=TIMEOUT,
             )
+            response.raise_for_status()
             rows, current_total = parse_micro1_portal_page(response.json())
         except SourceError:
             raise
@@ -809,120 +730,35 @@ def _fetch_micro1_sitemap(session, known_ids, initial):
     return list(found.values())
 
 
-
-def _fetch_micro1_playwright() -> list[Job]:
-    """Load the public opportunities page in Chromium and capture the portal API JSON.
-
-    GitHub Actions IPs are often blocked from prod-api.micro1.ai over plain HTTP.
-    A real browser frequently succeeds because of different TLS/JA3 and cookies.
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise SourceError("Playwright is not installed") from exc
-
-    captured: list = []
-    found: dict[str, Job] = {}
-
-    def on_response(response):
-        try:
-            url = response.url or ""
-            if "prod-api.micro1.ai" not in url and "api/v1/job" not in url:
-                return
-            if response.status != 200:
-                return
-            ctype = (response.headers or {}).get("content-type", "")
-            if "json" not in ctype and "javascript" not in ctype:
-                return
-            body = response.json()
-            captured.append(body)
-            if isinstance(body, dict) and isinstance(body.get("data"), list):
-                for raw in body["data"]:
-                    job = micro1_job_from_portal(raw)
-                    if job:
-                        found[job.job_id] = job
-            else:
-                for job in _micro1_from_json(body):
-                    found[job.job_id] = job
-        except Exception:
-            return
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=True,
-            args=["--disable-dev-shm-usage", "--no-sandbox"],
-        )
-        try:
-            context = browser.new_context(
-                user_agent=HEADERS["User-Agent"],
-                locale="en-US",
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            )
-            page = context.new_page()
-            page.on("response", on_response)
-            # Prefer the experts opportunities UI; fall back to jobs portal.
-            for start_url in (MICRO1_EXPERTS, MICRO1_PORTAL):
-                try:
-                    page.goto(start_url, wait_until="domcontentloaded", timeout=45000)
-                    page.wait_for_timeout(2500)
-                    _render_micro1_page(page)
-                    page.wait_for_timeout(1500)
-                    if found:
-                        break
-                    # Also parse whatever HTML we got (links / embedded JSON)
-                    for job in parse_micro1_html(page.content()):
-                        found[job.job_id] = job
-                    if found:
-                        break
-                except Exception as exc:
-                    LOG.warning("Playwright Micro1 navigation failed for %s: %s", start_url, type(exc).__name__)
-            page.close()
-            context.close()
-        finally:
-            browser.close()
-
-    if not found:
-        raise SourceError(
-            f"Playwright Micro1 found 0 jobs (captured {len(captured)} API responses)"
-        )
-    LOG.info("Micro1 Playwright: %d jobs from %d captured API responses", len(found), len(captured))
-    return list(found.values())
-
-
 def fetch_micro1(session=None, known_ids=None, initial=None) -> list[Job]:
-    """Use Micro1's official opportunities API; fall back to Playwright, then sitemap.
+    """Use Micro1's official opportunities API; if unavailable try its own sitemap.
 
     No third-party listings; never mark unverified new sitemap jobs as seen.
     """
     session = session or requests.Session()
-    session.headers.update(MICRO1_API_HEADERS)
-    errors = []
+    session.headers.update({
+        **HEADERS,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.micro1.ai",
+        "Referer": "https://www.micro1.ai/experts/opportunities",
+    })
     try:
         return _fetch_micro1_api(session)
     except SourceError as primary:
         if "HTTP 429" in str(primary):
             raise  # Respect Micro1's rate limits; try on the next scheduled run.
-        errors.append(str(primary))
-        LOG.warning("%s; trying Playwright browser collection", primary)
-
-    try:
-        return _fetch_micro1_playwright()
-    except SourceError as browser_err:
-        errors.append(str(browser_err))
-        LOG.warning("%s; trying Micro1's own public job sitemap", browser_err)
-
-    if known_ids is None or initial is None:
-        stored_ids, is_initial = _micro1_state_for_fallback()
-        if known_ids is None:
-            known_ids = stored_ids
-        if initial is None:
-            initial = is_initial
-    try:
-        return _fetch_micro1_sitemap(session, known_ids, initial)
-    except SourceError as fallback:
-        raise SourceError("; ".join(errors + [f"official sitemap fallback: {fallback}"])) from None
+        LOG.warning("%s; trying Micro1's own public job sitemap", primary)
+        if known_ids is None or initial is None:
+            stored_ids, is_initial = _micro1_state_for_fallback()
+            if known_ids is None:
+                known_ids = stored_ids
+            if initial is None:
+                initial = is_initial
+        try:
+            return _fetch_micro1_sitemap(session, known_ids, initial)
+        except SourceError as fallback:
+            raise SourceError(f"{primary}; official sitemap fallback: {fallback}") from None
 
 
 def enrich_micro1_new_jobs(jobs: list[Job]) -> list[Job]:
