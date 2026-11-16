@@ -18,7 +18,8 @@ from pathlib import Path
 import requests
 
 from models import Job
-from sources import SourceError, enrich_micro1_new_jobs, fetch_mercor, fetch_micro1
+from sources import SourceError, enrich_micro1_new_jobs, fetch_mercor
+from micro1_playwright import fetch_micro1
 
 LOG = logging.getLogger("jobbot")
 STATE_PATH = Path(os.environ.get("STATE_PATH", "data/seen_jobs.json"))
