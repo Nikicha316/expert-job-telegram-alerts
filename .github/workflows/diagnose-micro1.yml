@@ -1,0 +1,92 @@
+name: Diagnose Micro1 official opportunities page
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright and Chromium
+        run: |
+          python -m pip install 'playwright>=1.55,<2'
+          python -m playwright install --with-deps chromium
+
+      - name: Inspect what GitHub browser really sees
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          from urllib.parse import urlparse
+          from playwright.sync_api import sync_playwright
+
+          out = Path('micro1-diagnostic')
+          out.mkdir(exist_ok=True)
+          events = []
+          target = 'https://www.micro1.ai/experts/opportunities'
+
+          def record_response(response):
+              parsed = urlparse(response.url)
+              host = (parsed.hostname or '').lower()
+              if host == 'micro1.ai' or host.endswith('.micro1.ai'):
+                  events.append({'status': response.status, 'host': host,
+                                 'path': parsed.path, 'resource': response.request.resource_type})
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(viewport={'width': 1400, 'height': 1000}, locale='en-US')
+              page = context.new_page()
+              page.on('response', record_response)
+              try:
+                  navigation = page.goto(target, wait_until='domcontentloaded', timeout=45000)
+                  print('Page status:', navigation.status if navigation else 'no response')
+              except Exception as exc:
+                  print('Page navigation exception:', type(exc).__name__)
+
+              page.wait_for_timeout(16000)
+              try:
+                  print('Page title:', page.title())
+                  body_text = page.locator('body').inner_text(timeout=5000)
+                  print('Visible page text (first 2000 chars):', body_text[:2000])
+                  print('Visible text length:', len(body_text))
+              except Exception as exc:
+                  print('Body read failed:', type(exc).__name__)
+              for idx, frame in enumerate(page.frames):
+                  try:
+                      links = frame.locator('a[href*="/post/"]').count()
+                      print(f'Frame {idx} host: {urlparse(frame.url).hostname}; /post/ links: {links}')
+                  except Exception:
+                      continue
+              print('Official response statuses:', dict(Counter(e['status'] for e in events)))
+              print('Failed requests:', [e for e in events if e['status'] >= 400][:15])
+              try:
+                  page.screenshot(path=str(out / 'micro1.png'), full_page=True, timeout=20000)
+              except Exception as exc:
+                  print('Screenshot failed:', type(exc).__name__)
+              try:
+                  (out / 'micro1-rendered.html').write_text(page.content(), encoding='utf-8')
+              except Exception as exc:
+                  print('HTML snapshot failed:', type(exc).__name__)
+              (out / 'micro1-responses.json').write_text(json.dumps(events, indent=2), encoding='utf-8')
+              context.close()
+              browser.close()
+          PY
+
+      - name: Downloadable screenshot and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: micro1-browser-diagnostic
+          path: micro1-diagnostic/
+          if-no-files-found: warn
+          retention-days: 3
