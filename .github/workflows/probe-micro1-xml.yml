@@ -1,0 +1,19 @@
+name: Probe Micro1 official XML RSS files (one-off)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: One-off official Micro1 XML probe (no API, no bot changes)
+        run: python probe_micro1_xml.py
